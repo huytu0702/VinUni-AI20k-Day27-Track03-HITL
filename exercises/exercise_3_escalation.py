@@ -43,9 +43,9 @@ def node_analyze(state):
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
             {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
+                "Senior reviewer. Structured output. If confidence is below 60%, "
+                "populate escalation_questions with 2-4 specific, context-rich "
+                "questions that reference the relevant file or diff section."
             )},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
@@ -71,22 +71,36 @@ def node_escalate(state: ReviewState) -> dict:
         # fallback when the LLM didn't generate any questions
         questions = ["What is the intent of this PR?", "Any migration concerns?"]
 
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    answers = interrupt({
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": questions,
+    })
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    initial = state["analysis"]
+    answers = state.get("escalation_answers") or {}
+    qa = "\n".join(f"Q: {question}\nA: {answer}" for question, answer in answers.items())
+    llm = get_llm().with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM refining review with reviewer answers...[/dim]"):
+        refined = llm.invoke([
+            {"role": "system", "content": "Refine the PR review using the reviewer answers. Return structured PRAnalysis output."},
+            {"role": "user", "content": (
+                f"Original summary: {initial.summary}\n"
+                f"Original confidence reasoning: {initial.confidence_reasoning}\n"
+                f"Original risk factors: {initial.risk_factors}\n\n"
+                f"Diff:\n{state['pr_diff']}\n\nReviewer Q&A:\n{qa}"
+            )},
+        ])
+    console.print(f"  [green]✓[/green] refined confidence={refined.confidence:.0%}")
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -161,7 +175,8 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=MemorySaver())
 
 
@@ -173,7 +188,9 @@ def handle_interrupt(payload):
             title=f"Approve? conf={payload['confidence']:.0%}",
             border_style="green",
         ))
-        choice = console.input("approve/reject/edit? ").strip().lower()
+        choice = ""
+        while choice not in {"approve", "reject", "edit"}:
+            choice = console.input("approve/reject/edit? ").strip().lower()
         return {"choice": choice, "feedback": console.input("Feedback: ").strip()}
     if kind == "escalation":
         console.print(Panel.fit(
@@ -181,7 +198,13 @@ def handle_interrupt(payload):
             title=f"Escalation conf={payload['confidence']:.0%}",
             border_style="yellow",
         ))
-        return {q: console.input(f"Q: {q}\nA: ").strip() for q in payload["questions"]}
+        answers = {}
+        for question in payload["questions"]:
+            answer = ""
+            while not answer:
+                answer = console.input(f"Q: {question}\nA: ").strip()
+            answers[question] = answer
+        return answers
     raise ValueError(kind)
 
 
